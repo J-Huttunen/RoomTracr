@@ -2,16 +2,13 @@
 
 Huoneen käyttöasteen ja ympäristödatan mittaus.
 
-⚠️ Tämä README kuvaa projektin nykyistä tilannetta.
-
-⚠️ Dokumentaatio täydentyy vielä.
 
 ## Käytetty laitteisto ja palvelut
 
 - Raspberry Pi Zero W
 - Pimoroni Enviro+ 
 - PIR-liiketunnistin (SBC-PIR)
-- PostgreSQL-tietokanta (CSC DBaaS)
+- PostgreSQL-tietokanta (alun perin CSC DBaaS, myöhemmin oma Docker-palvelin)
 - Grafana (asennettu Hetznerin palvelimelle)
 
 ## Sensorit ja mitattavat arvot
@@ -21,7 +18,10 @@ Sensorit mittaavat seuraavat arvot:
 - Lämpötila
 - Ilmanpaine
 - Ilmankosteus
-- Kaasut (oxidised/carbon monoxide, reduced/nitrogen dioxide, NH₃)
+- Kaasut:
+    - `oxidised`: hapettavat kaasut (esim. NO₂)
+    - `reduced`: pelkistävät kaasut (esim. CO, alkoholit)
+  - `nh3`: esim. ammoniakki
 - Ilman partikkelit (PM1, PM2.5, PM10)
 - Valo (lux)
 - Liiketunnistus (motion: True/False)
@@ -33,7 +33,7 @@ Jotta järjestelmän eri osat voivat kommunikoida CSC:n tietokannan kanssa, hyv�
 - Raspberry Pi lähettää sensoridataa CSC:n tietokantaan Python-skriptin kautta.
 - Hetznerin palvelin pyörittää Grafanaa, joka hakee ja visualisoi tietokannassa olevaa dataa.
 
-### 1. Raspberry Pi:n valmistelu ja Enviro+:n asennus
+### Raspberry Pi:n valmistelu ja Enviro+:n asennus
 
 1. Flashaa Raspberry Pi OS microSD-kortille ja käynnistä Pi.
 
@@ -46,7 +46,7 @@ cd enviroplus-python
 ./install.sh
 ```
 
-### 2. PIR-liiketunnistimen kytkeminen
+**PIR-liiketunnistimen kytkeminen**
 
 Liiketunnistin kytkettiin suoraan Enviro+-levyn läpivienteihin seuraavasti:
 
@@ -58,7 +58,9 @@ Liiketunnistin kytkettiin suoraan Enviro+-levyn läpivienteihin seuraavasti:
 
 Tunnistin mittaa liikettä ja palauttaa `True`, kun liikettä havaitaan.
 
-### 3. PostgreSQL-tietokanta CSC:n DBaaS:ssa
+### PostgreSQL-tietokanta CSC:n DBaaS:ssa
+
+**CSC DBaaS (projektin alkuvaiheessa)**
 
 1. Luotu tietokanta CSC:n hallintapaneelissa.
 
@@ -82,16 +84,50 @@ CREATE TABLE data (
     lux INTEGER
 );
 ```
+### Siirto omalle palvelimelle
 
-### 4. Datan keruu (Raspilla)
+**Dockerin pystytys Hetzner-palvelimella**
+
+``` bash
+docker run --name=db \
+  -e POSTGRES_PASSWORD=<password> \
+  -p <port>:<port> \
+  -d -v postgres_data:/var/lib/postgresql/data postgres
+```
+
+**Lokaali Docker**
+
+Paikallinen Docker-kontti ajettiin samaa PostgreSQL-versiota käyttäen kuin tuotantokannassa, jotta varmistettiin yhteensopivuus dumpin ja palautuksen välillä, koska eri PostgreSQL-versioiden välillä voi tulla ongelmia dump/restore-prosessissa.
+
+```bash
+docker run --rm -it -v ~/asdf:/asdf docker.io/postgres:17 bash
+```
+
+**Varmuuskopiointi (dump) paikallisessa Docker-kontissa**
+
+Tietokanta dumpattiin vanhasta kannasta tiedostoon:
+```bash
+pg_dump -U <user> -d <db_name> -f <file.sql> -h <ip>
+```
+
+**Palautus (restore) paikallisessa Docker-kontissa:**
+
+Dump -tiedosto ajettiin uuteen tietokantaan palautuksena:
+
+```bash
+psql -h <ip> -U <user> -d <db_name> -f <file.sql>
+```
+
+### Datan keruu (Raspilla)
 
 Python-skripti (`main.py`) lukee sensoreita ja tallentaa arvot PostgreSQL-tietokantaan 10 sekunnin välein. 
 
-### 5. Grafana (Hetznerin palvelimella)
+### Grafana (Hetznerin palvelimella)
 
-1. Vuokrattu Hetznerin virtuaalipalvelin (debian).
+1. Vuokrattu Hetznerin palvelin (debian).
 
 2. Asennettu Docker ja Grafana
+   
 ```bash
 docker run -d -p 3000:3000 \
   --name=grafana \
@@ -108,11 +144,61 @@ docker run -d -p 3000:3000 \
 
 ![Grafana](images/grafana.png)
 
+**Käyttöasteen mittaus Grafanassa**
 
-## Tilanne tällä hetkellä
+Käyttöasteen mittaus suoraan Grafanassa lisäämällä paneeliin sql lauseke:
 
-- Sensoridatan keruu ja tallennus toimii Raspberryltä CSC:n tietokantaan
+```sql
+SELECT
+  date_range,
+  (COUNT(*)::decimal / 24) * 100 AS room_occupied
+FROM (
+  SELECT
+    DATE_TRUNC('day', timestamp) AS date_range,
+    DATE_TRUNC('hour', timestamp) AS hour,
+    AVG(motion::int) AS avg_motion,
+    AVG(lux) AS avg_light_when_occupied,
+    AVG(oxidised) AS avg_oxidise_when_occupied,
+    AVG(pressure) AS avg_pressure_when_occupied,
+    AVG(reduced) AS avg_reduced_when_occupied,
+    AVG(humidity) AS avg_humidity_when_occupied
+  FROM data
+  WHERE timestamp BETWEEN $__timeFrom() AND $__timeTo()
+  GROUP BY date_range, DATE_TRUNC('hour', timestamp)
+) AS hourly_data
+WHERE avg_motion > 0
+GROUP BY date_range
+ORDER BY date_range;
+```
+→ Lasketaan tunneittain käyttöä, ja niistä koostetaan prosentuaalinen käyttöaste / päivä.  
 
-- Grafana toimii Hetznerin palvelimella ja lukee dataa onnistuneesti
+### Kaasuarvojen tulkinta
 
-- PIR-liiketunnistin ja valosensori on mukana datankeruussa
+Enviro+:ssa on MICS6814-kaasusensori, joka mittaa kolmea kaasuluokkaa:
+
+- Oxidising → havaitsee hapettavia kaasuja (esim. NO₂)
+
+- Reducing → havaitsee pelkistäviä kaasuja (esim. CO, alkoholit)
+
+- NH₃ → havaitsee ammoniakkia
+
+
+Sensori ei anna suoraan kaasujen pitoisuuksia (ppm), vaan mittaa resistanssia sensorin sisällä olevassa materiaalissa.
+
+Periaate:
+
+- Kun ilmassa on enemmän kaasumolekyylejä → kaasua tarttuu sensorin pintaan
+
+- → Sensorin johtavuus kasvaa, mikä tarkoittaa että
+
+- → Resistanssi (vastus) laskee
+
+
+Lopputulos: enemmän kaasua ilmassa → matalampi resistanssi → pienempi arvo
+
+Toisin sanoen:
+
+- Korkeat arvot → ilma puhtaampaa
+
+- Matala arvo → enemmän kaasuja ilmassa (esim. ihmisen läsnäolo, ruoanlaitto, hengitys)
+
